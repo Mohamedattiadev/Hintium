@@ -27,7 +27,8 @@ from gi.repository import Atspi, Gdk, GLib, Gtk  # noqa: E402
 
 from . import config, elements, theme, x11  # noqa: E402
 from .overlay import (  # noqa: E402
-    badge, draw_legend, keys, mode_switch, normalize_key, place_chip,
+    badge, draw_legend, init_fullscreen_layer, keys, mode_switch,
+    normalize_key, place_chip, release_layer_keyboard, retake_layer_keyboard,
     screen_size, set_identity, text_part,
 )
 
@@ -139,9 +140,20 @@ def collect(screen_w, screen_h, min_chars=None, require_text=True):
     # tabs alive otherwise offers five pages of text stacked on one viewport.
     frame = elements.active_frame(app, (win_x, win_y, win_w, win_h))
     scope = frame if frame is not None else app
+
+    # See elements._screen_delta's docstring.
+    reference = frame
+    if reference is None:
+        try:
+            if app.get_child_count() >= 1:
+                reference = app.get_child_at_index(0)
+        except Exception:
+            reference = None
+    delta = elements._screen_delta(reference, win_x, win_y) \
+        if reference is not None else (0, 0)
+
     try:
-        title = x11.window_name(x11.active_window_id() or 0) if \
-            x11.available() else ""
+        title = elements.active_window_title()
         document = elements.active_document(scope, title)
         if document is not None:
             scope = document
@@ -180,7 +192,7 @@ def collect(screen_w, screen_h, min_chars=None, require_text=True):
         matches = list(matches) + list(query(config.CARET_ROLES_FALLBACK))
 
     found = []
-    for accessible, ext in elements._extents(matches, win_x, win_y):
+    for accessible, ext in elements._extents(matches, win_x, win_y, delta):
         cx, cy = ext.x + ext.width // 2, ext.y + ext.height // 2
         if not (left <= cx < right and top <= cy < bottom):
             continue
@@ -204,7 +216,8 @@ def collect(screen_w, screen_h, min_chars=None, require_text=True):
 
     if not found and require_text:
         found = _shape(query(config.CARET_ROLES_FALLBACK), win_x, win_y,
-                       left, top, right, bottom, min_chars, require_text)
+                       left, top, right, bottom, min_chars, require_text,
+                       delta)
 
     # Still nothing, and the length rule is the only thing that could have
     # rejected anything: try again without it. The minimum exists to keep the
@@ -217,17 +230,17 @@ def collect(screen_w, screen_h, min_chars=None, require_text=True):
     if not found and require_text and min_chars > config.CARET_MIN_CHARS_FLOOR:
         found = _shape(list(matches) + list(query(config.CARET_ROLES_FALLBACK)),
                        win_x, win_y, left, top, right, bottom,
-                       config.CARET_MIN_CHARS_FLOOR, require_text)
+                       config.CARET_MIN_CHARS_FLOOR, require_text, delta)
 
     found.sort(key=lambda e: e.w * e.h, reverse=True)
     return found
 
 
 def _shape(matches, win_x, win_y, left, top, right, bottom, min_chars,
-           require_text):
+           require_text, delta=(0, 0)):
     """Filter raw matches down to usable text blocks."""
     out = []
-    for accessible, ext in elements._extents(matches, win_x, win_y):
+    for accessible, ext in elements._extents(matches, win_x, win_y, delta):
         cx, cy = ext.x + ext.width // 2, ext.y + ext.height // 2
         if not (left <= cx < right and top <= cy < bottom):
             continue
@@ -293,6 +306,28 @@ class CaretSession:
         self.pending_y = False
         self.pending_d = False
 
+        # See elements._screen_delta's docstring -- Atspi.Text's own SCREEN
+        # coordinates need the same per-window correction _extents() applies
+        # to Atspi.Component's, or the caret drew in the wrong place on any
+        # window Chromium's native-Wayland bridge misreports.
+        self._delta = (0, 0)
+        window = elements.active_window()
+        if window is not None:
+            pid, win_x, win_y, win_w, win_h = window
+            app = elements._app_for_pid(pid)
+            if app is not None:
+                reference = elements.active_frame(
+                    app, (win_x, win_y, win_w, win_h))
+                if reference is None:
+                    try:
+                        if app.get_child_count() >= 1:
+                            reference = app.get_child_at_index(0)
+                    except Exception:
+                        reference = None
+                if reference is not None:
+                    self._delta = elements._screen_delta(
+                        reference, win_x, win_y)
+
         set_identity()
         self.colors = theme.palette()
         self.width, self.height = screen_size()
@@ -305,6 +340,13 @@ class CaretSession:
         self.window.set_accept_focus(True)
         self.window.set_skip_taskbar_hint(True)
         self.window.set_skip_pager_hint(True)
+
+        # See overlay.init_fullscreen_layer()'s docstring: without this a
+        # tiling Wayland compositor tiles this window like any other one.
+        monitor_size = init_fullscreen_layer(self.window)
+        self._layered = monitor_size is not None
+        if self._layered:
+            self.width, self.height = monitor_size
         self.window.set_default_size(self.width, self.height)
 
         screen = Gdk.Screen.get_default()
@@ -328,9 +370,10 @@ class CaretSession:
 
     def show(self):
         self.window.show_all()
-        self.window.move(0, 0)
-        self.window.resize(self.width, self.height)
-        self.window.fullscreen()
+        if not self._layered:
+            self.window.move(0, 0)
+            self.window.resize(self.width, self.height)
+            self.window.fullscreen()
         gdk_window = self.window.get_window()
         if gdk_window is not None:
             gdk_window.raise_()
@@ -422,6 +465,12 @@ class CaretSession:
     # -- input ----------------------------------------------------------
 
     def _grab(self):
+        if self._layered:
+            retake_layer_keyboard(self.window)
+            x11.release_modifiers()
+            self._grabbed = True
+            self._sync_caret()
+            return False
         gdk_window = self.window.get_window()
         if gdk_window is not None:
             seat = Gdk.Display.get_default().get_default_seat()
@@ -752,7 +801,10 @@ class CaretSession:
     def _release_grab(self):
         if self._grabbed:
             try:
-                Gdk.Display.get_default().get_default_seat().ungrab()
+                if self._layered:
+                    release_layer_keyboard(self.window)
+                else:
+                    Gdk.Display.get_default().get_default_seat().ungrab()
             except Exception:
                 pass
             self._grabbed = False
@@ -797,7 +849,8 @@ class CaretSession:
             GLib.source_remove(self._idle)
             self._idle = None
         if self._grabbed:
-            Gdk.Display.get_default().get_default_seat().ungrab()
+            if not self._layered:
+                Gdk.Display.get_default().get_default_seat().ungrab()
             self._grabbed = False
             # See Overlay._ungrab: a grab taken under a held modifier eats the
             # key-up, leaving the modifier logically stuck.
@@ -828,6 +881,8 @@ class CaretSession:
                 ext.width = 8
             if ext.height <= 0:
                 ext.height = config.FONT_SIZE + 4
+            ext.x += self._delta[0]
+            ext.y += self._delta[1]
             return ext
         except Exception:
             return None
@@ -849,7 +904,8 @@ class CaretSession:
                 rect = Atspi.Text.get_range_extents(
                     self.iface, span[0], span[1], Atspi.CoordType.SCREEN)
                 cr.set_source_rgba(*self.colors["chip_matched"][:3], 0.35)
-                cr.rectangle(rect.x, rect.y, rect.width, rect.height)
+                cr.rectangle(rect.x + self._delta[0], rect.y + self._delta[1],
+                             rect.width, rect.height)
                 cr.fill()
             except Exception:
                 pass
@@ -967,6 +1023,13 @@ class CaretSearchPrompt:
         self.window.set_accept_focus(True)
         self.window.set_skip_taskbar_hint(True)
         self.window.set_skip_pager_hint(True)
+
+        # See overlay.init_fullscreen_layer()'s docstring: without this a
+        # tiling Wayland compositor tiles this window like any other one.
+        monitor_size = init_fullscreen_layer(self.window)
+        self._layered = monitor_size is not None
+        if self._layered:
+            self.width, self.height = monitor_size
         self.window.set_default_size(self.width, self.height)
 
         screen = Gdk.Screen.get_default()
@@ -987,9 +1050,10 @@ class CaretSearchPrompt:
 
     def show(self):
         self.window.show_all()
-        self.window.move(0, 0)
-        self.window.resize(self.width, self.height)
-        self.window.fullscreen()
+        if not self._layered:
+            self.window.move(0, 0)
+            self.window.resize(self.width, self.height)
+            self.window.fullscreen()
         gdk_window = self.window.get_window()
         if gdk_window is not None:
             gdk_window.raise_()
@@ -1021,6 +1085,10 @@ class CaretSearchPrompt:
     # -- input ------------------------------------------------------------
 
     def _grab(self):
+        if self._layered:
+            x11.release_modifiers()
+            self._grabbed = True
+            return False
         gdk_window = self.window.get_window()
         if gdk_window is not None:
             seat = Gdk.Display.get_default().get_default_seat()
@@ -1103,7 +1171,8 @@ class CaretSearchPrompt:
             GLib.source_remove(self._idle)
             self._idle = None
         if self._grabbed:
-            Gdk.Display.get_default().get_default_seat().ungrab()
+            if not self._layered:
+                Gdk.Display.get_default().get_default_seat().ungrab()
             self._grabbed = False
             x11.release_modifiers()
         self.window.destroy()

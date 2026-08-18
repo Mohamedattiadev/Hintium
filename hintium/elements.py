@@ -15,7 +15,7 @@ import gi
 gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi  # noqa: E402
 
-from . import config, x11  # noqa: E402
+from . import config, hypr, x11  # noqa: E402
 
 
 @dataclass
@@ -64,11 +64,18 @@ def _roles(names=None):
 
 
 def active_window():
-    """(pid, x, y, w, h) of the focused X11 window, or None.
+    """(pid, x, y, w, h) of the focused window, or None.
 
     The geometry lets us scope results to the focused window without the
     per-child AT-SPI state probing that frame detection would cost (~127ms).
     """
+    if hypr.available():
+        window = hypr.active_window()
+        if window and _mostly_on_screen((window.x, window.y, window.w,
+                                         window.h)):
+            return (window.pid, window.x, window.y, window.w, window.h)
+        return None
+
     if x11.available():
         window = x11.active_window_id()
         if window:
@@ -97,6 +104,20 @@ def active_window():
     except (ValueError, KeyError, IndexError, OSError,
             subprocess.SubprocessError):
         return None
+
+
+def active_window_title():
+    """Title of the focused window, for active_document()'s browser check.
+
+    Shared by hint mode and caret mode so the hypr/x11/xdotool cascade lives
+    in exactly one place.
+    """
+    if hypr.available():
+        window = hypr.active_window()
+        return window.title if window else ""
+    if x11.available():
+        return x11.window_name(x11.active_window_id() or 0)
+    return ""
 
 
 def _is_desktop(window):
@@ -201,22 +222,33 @@ def active_frame(app, window_rect):
     if window_rect is None:
         return None
     wx, wy, ww, wh = window_rect
-    best, best_score = None, None
+    # Position and size are graded separately, not combined into one score:
+    # Chromium's native-Wayland accessibility bridge reports its own frame's
+    # SCREEN position relative to itself -- (0, 0) for a window that is
+    # really at (400, 300) -- while its width and height stay correct.
+    # Position is unusable as a gate there, sometimes off by hundreds of
+    # pixels for a window sitting nowhere near the screen origin, but size
+    # alone already answers the question this function exists for: telling
+    # the real focused frame apart from another one of the same app's
+    # windows. Position still breaks the tie between two frames of matching
+    # size -- the original "three sharing one rectangle" case -- since a
+    # size match alone cannot.
+    candidates = []
     for frame, _ in frames:
         try:
             ext = frame.get_component_iface().get_extents(
                 Atspi.CoordType.SCREEN)
         except Exception:
             continue
-        score = (abs(ext.x - wx) + abs(ext.y - wy)
-                 + abs(ext.width - ww) + abs(ext.height - wh))
-        if best_score is None or score < best_score:
-            best, best_score = frame, score
-    # Only trust a close match; a wildly different frame means we cannot tell.
-    if (best is not None and best_score is not None
-            and best_score <= config.FRAME_MATCH_TOLERANCE):
-        return best
-    return None
+        size_diff = abs(ext.width - ww) + abs(ext.height - wh)
+        if size_diff > config.FRAME_MATCH_TOLERANCE:
+            continue
+        position_diff = abs(ext.x - wx) + abs(ext.y - wy)
+        candidates.append((position_diff, frame))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
 
 
 def active_document(app, window_title):
@@ -376,7 +408,38 @@ class _Rect:
         self.x, self.y, self.width, self.height = x, y, width, height
 
 
-def _extents(matches, win_x, win_y):
+def _screen_delta(reference, win_x, win_y):
+    """Correction needed for a toolkit that misreports SCREEN coordinates.
+
+    Chromium's native-Wayland accessibility bridge reports its own frame's
+    SCREEN extents relative to itself -- (0, 0) for a window the window
+    manager places at (400, 300) -- and every element under that frame
+    inherits the same offset, chrome and page content alike (measured live:
+    a frame at (0, 0, 1346, 715), a document at (4, 80, ...) that would sit
+    partly off the left edge of the window if taken as absolute, an omnibox
+    at (288, 46) that opened its editor 300-odd pixels short of the real
+    one). GTK and Qt apps, and Chromium under XWayland, do not have this bug
+    -- their frame's own SCREEN extents already agree with the window
+    manager's -- which is what makes this detectable per window rather than
+    assumed for a whole toolkit or platform: compare the two, and if they
+    disagree by more than rounding noise, that difference is the correction
+    every element from this window needs.
+    """
+    try:
+        component = reference.get_component_iface()
+        if component is None:
+            return (0, 0)
+        ext = component.get_extents(Atspi.CoordType.SCREEN)
+    except Exception:
+        return (0, 0)
+    dx, dy = win_x - ext.x, win_y - ext.y
+    if abs(dx) <= config.SCREEN_DELTA_TOLERANCE and \
+            abs(dy) <= config.SCREEN_DELTA_TOLERANCE:
+        return (0, 0)
+    return (dx, dy)
+
+
+def _extents(matches, win_x, win_y, delta=(0, 0)):
     """Pair each accessible with its screen rectangle.
 
     Some toolkits report SCREEN coordinates as 0,0 for everything -- pavucontrol
@@ -384,6 +447,10 @@ def _extents(matches, win_x, win_y):
     at the whole batch rather than any single element, since one element
     legitimately sitting at the origin is not evidence of anything, then
     re-read in WINDOW space and offset by the window's own position.
+
+    `delta` is the separate, per-window correction from _screen_delta --
+    applied last, after the pavucontrol-style repair above, so the two never
+    fight over the same pixels.
     """
     pairs = []
     for acc in matches:
@@ -397,21 +464,28 @@ def _extents(matches, win_x, win_y):
         pairs.append((acc, _Rect(ext.x, ext.y, ext.width, ext.height)))
 
     at_origin = sum(1 for _, e in pairs if e.x == 0 and e.y == 0)
-    if len(pairs) < 3 or at_origin < len(pairs) * 0.75:
-        return pairs
+    if len(pairs) >= 3 and at_origin >= len(pairs) * 0.75:
+        repaired = []
+        for acc, screen_ext in pairs:
+            try:
+                ext = acc.get_component_iface().get_extents(
+                    Atspi.CoordType.WINDOW)
+            except Exception:
+                repaired.append((acc, screen_ext))
+                continue
+            repaired.append((
+                acc,
+                _Rect(ext.x + win_x, ext.y + win_y, ext.width, ext.height),
+            ))
+        pairs = repaired
 
-    repaired = []
-    for acc, screen_ext in pairs:
-        try:
-            ext = acc.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
-        except Exception:
-            repaired.append((acc, screen_ext))
-            continue
-        repaired.append((
-            acc,
-            _Rect(ext.x + win_x, ext.y + win_y, ext.width, ext.height),
-        ))
-    return repaired
+    if delta == (0, 0):
+        return pairs
+    dx, dy = delta
+    return [
+        (acc, _Rect(rect.x + dx, rect.y + dy, rect.width, rect.height))
+        for acc, rect in pairs
+    ]
 
 
 def _encloses(outer, inner):
@@ -491,23 +565,39 @@ def collect(screen_w, screen_h):
     if frame is not None:
         scope = frame
 
+    # See _screen_delta's docstring. `reference` needs an actual frame, not
+    # the bare application object, which single-window apps don't get from
+    # active_frame() (it bails out below two children -- nothing to
+    # disambiguate) even though there is still exactly one real frame to
+    # read.
+    reference = frame
+    if reference is None:
+        try:
+            if app.get_child_count() >= 1:
+                reference = app.get_child_at_index(0)
+        except Exception:
+            reference = None
+    delta = _screen_delta(reference, win_x, win_y) if reference is not None \
+        else (0, 0)
+
     document = None
     doc_rect = None
     try:
-        title = x11.window_name(x11.active_window_id() or 0) if \
-            x11.available() else ""
+        title = active_window_title()
         document = active_document(scope, title)
         if document is not None:
             ext = document.get_component_iface().get_extents(
                 Atspi.CoordType.SCREEN)
-            doc_rect = (ext.x, ext.y, ext.width, ext.height)
+            doc_rect = (ext.x + delta[0], ext.y + delta[1],
+                       ext.width, ext.height)
     except Exception:
         document, doc_rect = None, None
 
     try:
         if document is not None:
             matches = list(_candidates(document))
-            for accessible, ext in _extents(_candidates(scope), win_x, win_y):
+            for accessible, ext in _extents(_candidates(scope), win_x, win_y,
+                                            delta):
                 if not _inside(ext, doc_rect):
                     matches.append(accessible)
         else:
@@ -525,7 +615,7 @@ def collect(screen_w, screen_h):
 
     seen = set()
     elements = []
-    for acc, ext in _extents(matches, win_x, win_y):
+    for acc, ext in _extents(matches, win_x, win_y, delta):
         if ext.width < config.MIN_SIZE or ext.height < config.MIN_SIZE:
             continue
         if ext.width > max_w and ext.height > max_h:

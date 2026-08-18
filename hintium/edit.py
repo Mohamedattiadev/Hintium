@@ -33,8 +33,10 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Atspi, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from . import config, elements, theme, x11  # noqa: E402
-from .overlay import screen_size, set_identity  # noqa: E402
+from . import config, elements, hypr, theme, x11  # noqa: E402
+from .overlay import (  # noqa: E402
+    init_positioned_layer, reposition_layer, screen_size, set_identity,
+)
 
 
 def _vte():
@@ -130,10 +132,25 @@ def collect(screen_w, screen_h):
     # five tabs alive otherwise offers five pages of fields on one viewport.
     frame = elements.active_frame(app, (win_x, win_y, win_w, win_h))
     scope = frame if frame is not None else app
+
+    # See elements._screen_delta's docstring: Chromium's native-Wayland
+    # accessibility bridge reports its own frame's position relative to
+    # itself, not the screen, and every field under it inherits the offset
+    # -- reported live as the editor opening hundreds of pixels short of the
+    # real field.
+    reference = frame
+    if reference is None:
+        try:
+            if app.get_child_count() >= 1:
+                reference = app.get_child_at_index(0)
+        except Exception:
+            reference = None
+    delta = elements._screen_delta(reference, win_x, win_y) \
+        if reference is not None else (0, 0)
+
     document = None
     try:
-        title = x11.window_name(x11.active_window_id() or 0) if \
-            x11.available() else ""
+        title = elements.active_window_title()
         document = elements.active_document(scope, title)
     except Exception:
         document = None
@@ -178,10 +195,13 @@ def collect(screen_w, screen_h):
     # document" is the thing to reject, and chrome -- which is outside the
     # viewport entirely -- is kept.
     viewport = _rect_of(document) if document is not None else None
+    if viewport is not None and delta != (0, 0):
+        vx, vy, vw, vh = viewport
+        viewport = (vx + delta[0], vy + delta[1], vw, vh)
     background = _background_documents(scope, document, win_x, win_y)
 
     found = []
-    for accessible, ext in elements._extents(matches, win_x, win_y):
+    for accessible, ext in elements._extents(matches, win_x, win_y, delta):
         cx, cy = ext.x + ext.width // 2, ext.y + ext.height // 2
         if not (left <= cx < right and top <= cy < bottom):
             continue
@@ -1017,7 +1037,12 @@ def _write_paste(field, text, window_id, log, on_landed=None):
 
     def focus():
         if window_id:
-            x11.activate_window(window_id)
+            # A str window_id is a Hyprland address (see service._active_
+            # window_id); an int is an X id, as it always was.
+            if isinstance(window_id, str):
+                hypr.activate(window_id)
+            else:
+                x11.activate_window(window_id)
         activated = since()
         # Focus the field itself without moving the pointer. Clicking it would
         # work and is the fallback, but a click lands wherever the field
@@ -1148,13 +1173,28 @@ def _borrow_clipboard(clipboard, ours, log):
 
 def _when_focused(window_id, then, log):
     """Call `then` once `window_id` has the focus, or after giving up."""
-    if window_id is None or not x11.available():
+    if window_id is None:
         then()
         return
+    if isinstance(window_id, str):
+        # A Hyprland address (see service._active_window_id).
+        if not hypr.available():
+            then()
+            return
+
+        def current():
+            window = hypr.active_window()
+            return window.address if window is not None else None
+    else:
+        if not x11.available():
+            then()
+            return
+
+        current = x11.active_window_id
 
     def check(remaining):
         try:
-            focused = x11.active_window_id()
+            focused = current()
         except Exception:
             focused = None
         if focused == window_id:
@@ -1269,8 +1309,16 @@ class EditSession:
         # and would no longer be the feature.
         self.window.set_type_hint(Gdk.WindowTypeHint.DIALOG)
         self.window.set_role(config.EDIT_WM_ROLE)
-        self.window.set_default_size(w, h)
-        self.window.move(x, y)
+
+        # See overlay.init_positioned_layer()'s docstring: without this a
+        # tiling Wayland compositor tiles this window like any other one,
+        # instead of it sitting where the field actually is.
+        self._layered = init_positioned_layer(self.window)
+        self._resize(w, h)
+        if self._layered:
+            reposition_layer(self.window, x, y)
+        else:
+            self.window.move(x, y)
         self.window.connect("delete-event", lambda *_: self._close())
 
         self._Vte = _vte()
@@ -1285,6 +1333,24 @@ class EditSession:
         frame.add(self.terminal)
         self._style(frame)
         self.window.add(frame)
+
+    def _resize(self, w, h):
+        """Set the window's size, whichever kind of window this is.
+
+        Gtk.Window.resize() is an X11-shaped request -- "make this existing
+        window this big" -- and a layer-shell surface anchored to fewer than
+        four edges does not take it: measured live, it left the window at
+        whatever size its content naturally wanted (a handful of pixels)
+        regardless of what resize() asked for. set_size_request() is what
+        actually drives a Wayland client's own size, on this window as on
+        any other -- resize() stays for the X11 path because it already
+        worked there and changing a working path for symmetry is not worth
+        the risk.
+        """
+        if self._layered:
+            self.window.set_size_request(w, h)
+        else:
+            self.window.resize(w, h)
 
     def _style(self, frame):
         try:
@@ -1382,8 +1448,11 @@ class EditSession:
                   f"({cols}x{grid_rows} cells of {char_w}x{char_h}, "
                   f"{chrome_w}x{chrome_h} of trim, compact={self.compact})")
 
-        self.window.move(x, y)
-        self.window.resize(w, h)
+        self._resize(w, h)
+        if self._layered:
+            reposition_layer(self.window, x, y)
+        else:
+            self.window.move(x, y)
 
     def _argv(self):
         """Attach to the warm server if there is one, else start cold.
@@ -1501,8 +1570,11 @@ class EditSession:
         self._rows = rows
         try:
             self.terminal.set_size(self.terminal.get_column_count(), rows)
-            self.window.move(x, y)
-            self.window.resize(w, h)
+            self._resize(w, h)
+            if self._layered:
+                reposition_layer(self.window, x, y)
+            else:
+                self.window.move(x, y)
         except Exception as error:
             self._log(f"could not grow the box: {error!r}")
             return
@@ -1669,6 +1741,20 @@ class EditSession:
             setattr(self, name, None)
         try:
             self.window.destroy()
+        except Exception:
+            pass
+        # The write-back that follows this needs another window to actually
+        # hold the keyboard -- paste is a keystroke -- and on the layer-shell
+        # path that window held it exclusively until just now. destroy() only
+        # queues the surface's teardown; without pumping the loop and syncing
+        # here, write-back's own focus + paste could run before the
+        # compositor has processed it and given keyboard input back to
+        # anything else, and land nowhere. Same reason Overlay._close() does
+        # this before its own on_choose().
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        try:
+            Gdk.Display.get_default().sync()
         except Exception:
             pass
         if self.warm:

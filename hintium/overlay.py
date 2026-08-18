@@ -5,6 +5,15 @@ for an unmanaged overlay, but under qtile + picom it maps without ever being
 composited -- it draws to nothing. A TOPLEVEL carrying the DOCK type hint
 composites correctly and qtile keeps it out of the tiling layout. We never set
 _NET_WM_STRUT, so no space is reserved for it either.
+
+That whole paragraph is X11 only. Wayland's xdg-shell has no wire-level
+equivalent of a DOCK type hint at all -- there is no "float me, cover the
+screen, keep me out of tiling" a client can ask for -- so on a tiling Wayland
+compositor a plain toplevel gets tiled like any other window. Reported live
+under Hyprland: hint mode opened a small tiled box instead of a fullscreen
+overlay, with hints drawn at their real absolute coordinates but clipped to
+whatever little rectangle the tiler handed the window. See
+init_fullscreen_layer() below for the fix.
 """
 
 import sys
@@ -15,6 +24,12 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+try:
+    gi.require_version("GtkLayerShell", "0.1")
+    from gi.repository import GtkLayerShell
+except (ImportError, ValueError):
+    GtkLayerShell = None
 
 from . import config, theme, x11  # noqa: E402
 
@@ -129,6 +144,17 @@ def screen_size():
     return right, bottom
 
 
+def _pointer_monitor():
+    """The Gdk.Monitor the pointer is on, or None if that cannot be asked."""
+    try:
+        display = Gdk.Display.get_default()
+        pointer = display.get_default_seat().get_pointer()
+        _, x, y = pointer.get_position()[:3]
+        return display.get_monitor_at_point(x, y)
+    except Exception:
+        return None
+
+
 def focused_monitor(width, height):
     """(x, y, w, h) of the monitor the pointer is on; the whole screen if unsure.
 
@@ -139,19 +165,136 @@ def focused_monitor(width, height):
     single-head desktop, which is why it went unnoticed.
     """
     whole = (0, 0, width, height)
-    try:
-        display = Gdk.Display.get_default()
-        pointer = display.get_default_seat().get_pointer()
-        _, x, y = pointer.get_position()[:3]
-        monitor = display.get_monitor_at_point(x, y)
-        if monitor is None:
-            return whole
-        area = monitor.get_geometry()
-        if area.width <= 0 or area.height <= 0:
-            return whole
-        return area.x, area.y, area.width, area.height
-    except Exception:
+    monitor = _pointer_monitor()
+    if monitor is None:
         return whole
+    area = monitor.get_geometry()
+    if area.width <= 0 or area.height <= 0:
+        return whole
+    return area.x, area.y, area.width, area.height
+
+
+def layer_shell_available():
+    """True if this compositor speaks wlr-layer-shell.
+
+    Every wlroots compositor (Hyprland and Sway among them) does; GNOME's
+    Mutter and plain X11 do not, and fall back to the .fullscreen()-on-a-
+    plain-toplevel path that is all there has ever been here.
+    """
+    return GtkLayerShell is not None and GtkLayerShell.is_supported()
+
+
+def init_fullscreen_layer(window):
+    """Turn `window` into a layer-shell surface covering the focused monitor.
+
+    Returns that monitor's own (width, height) on success, None if this
+    compositor has no layer-shell -- the caller's existing
+    move(0,0)/resize()/fullscreen() path on a plain toplevel is unchanged for
+    that case, which covers X11 and non-wlroots Wayland compositors alike.
+
+    A plain toplevel is the wrong kind of window for a modal, tiling-exempt
+    overlay on Wayland: see the module docstring for what that looks like in
+    practice. A layer-shell surface sidesteps the question instead of hoping
+    a window rule answers it -- it is never a tileable window to begin with,
+    it sits in the OVERLAY layer above everything by construction, and its
+    own keyboard-interactivity mode is a real compositor-side grab, which is
+    why every caller of this skips the manual Gdk.Seat.grab() once this
+    succeeds.
+
+    Sized and pinned to one monitor, not the union every plain-toplevel
+    overlay here draws across: a layer-shell surface belongs to exactly one
+    wl_output by protocol design, so covering more than one would need one
+    surface per monitor. Out of scope without a second monitor to test
+    against -- see the README's Limits section.
+    """
+    if not layer_shell_available():
+        return None
+    GtkLayerShell.init_for_window(window)
+    GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
+    for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
+                GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+        GtkLayerShell.set_anchor(window, edge, True)
+    # Cover the whole monitor even where a bar reserves space -- the same
+    # reason the X11 path never sets _NET_WM_STRUT.
+    GtkLayerShell.set_exclusive_zone(window, -1)
+    GtkLayerShell.set_keyboard_mode(window, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+
+    monitor = _pointer_monitor()
+    if monitor is None:
+        return None
+    GtkLayerShell.set_monitor(window, monitor)
+    area = monitor.get_geometry()
+    if area.width <= 0 or area.height <= 0:
+        return None
+    return area.width, area.height
+
+
+def init_positioned_layer(window):
+    """Turn `window` into a layer-shell surface anchored to one corner.
+
+    Edit mode's window sits exactly on the field it is editing -- an
+    arbitrary (x, y) picked from the field's own on-screen rectangle, not
+    "cover the monitor" like every other overlay here. Anchoring only TOP
+    and LEFT, rather than all four edges, is what keeps the surface at its
+    own requested size instead of being stretched to fill the monitor;
+    reposition_layer() below then moves it by margin, which is the
+    layer-shell equivalent of Gtk.Window.move() for an ordinary toplevel.
+
+    Same reason as init_fullscreen_layer: a plain toplevel here relied on
+    X11's DIALOG type hint to stay out of a tiling WM's layout, which
+    Wayland's xdg-shell has no equivalent of, so a tiling compositor tiled
+    it like any other window -- reported live as the editor opening
+    full-screen instead of over the field.
+    """
+    if not layer_shell_available():
+        return False
+    GtkLayerShell.init_for_window(window)
+    GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
+    GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.TOP, True)
+    GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.LEFT, True)
+    # Without this the TOP margin stacks on top of another layer's own
+    # reserved space (a topbar's, say) instead of being measured from the
+    # real screen edge -- measured live: a field at y=77 opened its editor
+    # at y=110, exactly a 33px topbar's reserved height too low.
+    GtkLayerShell.set_exclusive_zone(window, -1)
+    GtkLayerShell.set_keyboard_mode(window, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+    monitor = _pointer_monitor()
+    if monitor is not None:
+        GtkLayerShell.set_monitor(window, monitor)
+    return True
+
+
+def reposition_layer(window, x, y):
+    """Move a window set up by init_positioned_layer() to (x, y).
+
+    (x, y) is local to whichever monitor init_positioned_layer() pinned the
+    surface to -- correct wherever that monitor's own global origin is
+    (0, 0), which every single-monitor desktop's is. See the README's
+    Limits section for the multi-monitor caveat this shares with
+    init_fullscreen_layer.
+    """
+    GtkLayerShell.set_margin(window, GtkLayerShell.Edge.TOP, y)
+    GtkLayerShell.set_margin(window, GtkLayerShell.Edge.LEFT, x)
+
+
+def release_layer_keyboard(window):
+    """Temporarily give up a layer-shell surface's keyboard interactivity.
+
+    Gdk.Seat.grab()/ungrab() has no meaning for a layer-shell surface --
+    keyboard-interactivity there is a separate compositor-level setting, not
+    an X11-style grab -- so caret mode's "drop the grab so a synthetic
+    keystroke reaches the application underneath, then take it back" (see
+    caret.CaretSession._by_keystroke) needs its own equivalent on this path.
+    """
+    if GtkLayerShell is not None and GtkLayerShell.is_layer_window(window):
+        GtkLayerShell.set_keyboard_mode(window, GtkLayerShell.KeyboardMode.NONE)
+
+
+def retake_layer_keyboard(window):
+    """Undo release_layer_keyboard()."""
+    if GtkLayerShell is not None and GtkLayerShell.is_layer_window(window):
+        GtkLayerShell.set_keyboard_mode(
+            window, GtkLayerShell.KeyboardMode.EXCLUSIVE)
 
 
 class Overlay:
@@ -194,6 +337,8 @@ class Overlay:
         self.width, self.height = screen_size()
 
         self.window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        # Meaningless to a layer-shell surface, but harmless to set anyway --
+        # this is still the whole story on X11.
         self.window.set_type_hint(Gdk.WindowTypeHint.DOCK)
         self.window.set_app_paintable(True)
         self.window.set_decorated(False)
@@ -201,6 +346,12 @@ class Overlay:
         self.window.set_accept_focus(True)
         self.window.set_skip_taskbar_hint(True)
         self.window.set_skip_pager_hint(True)
+
+        # See init_fullscreen_layer()'s docstring for why this exists at all.
+        monitor_size = init_fullscreen_layer(self.window)
+        self._layered = monitor_size is not None
+        if self._layered:
+            self.width, self.height = monitor_size
         self.window.set_default_size(self.width, self.height)
 
         visual = screen.get_rgba_visual()
@@ -230,13 +381,16 @@ class Overlay:
         `on_choose` fires later, once the overlay has been torn down.
         """
         self.window.show_all()
-        # Position after mapping; a managed window may be placed by the WM
-        # before we get a say.
-        self.window.move(0, 0)
-        self.window.resize(self.width, self.height)
-        # Ask for true fullscreen so the WM cannot shrink us to the area left
-        # over by its bar, which would clip hints near the screen edges.
-        self.window.fullscreen()
+        if not self._layered:
+            # Position after mapping; a managed window may be placed by the
+            # WM before we get a say. A layer-shell surface has no such
+            # question -- its anchors already answered it before this ran.
+            self.window.move(0, 0)
+            self.window.resize(self.width, self.height)
+            # Ask for true fullscreen so the WM cannot shrink us to the area
+            # left over by its bar, which would clip hints near the screen
+            # edges.
+            self.window.fullscreen()
         # A fullscreen client can end up stacked above a freshly mapped dock,
         # which leaves the overlay drawing to nothing.
         gdk_window = self.window.get_window()
@@ -296,7 +450,16 @@ class Overlay:
         A grab attempted before the window is viewable fails with
         NOT_VIEWABLE, and the overlay would then silently swallow nothing
         while every keystroke went to the application underneath.
+
+        Layer-shell already asked for exclusive keyboard interactivity at
+        init_fullscreen_layer() and gets it the moment the surface is
+        mapped -- there is no separate grab call on that path, and no retry
+        loop needed either.
         """
+        if self._layered:
+            x11.release_modifiers()
+            self._grabbed = True
+            return False
         gdk_window = self.window.get_window()
         if gdk_window is not None:
             seat = Gdk.Display.get_default().get_default_seat()
@@ -331,7 +494,11 @@ class Overlay:
             GLib.source_remove(self._idle)
             self._idle = None
         if self._grabbed:
-            Gdk.Display.get_default().get_default_seat().ungrab()
+            # Nothing to release on the layer-shell path: there was no
+            # Gdk.Seat.grab() to begin with, and destroying the surface (see
+            # _close()) is what gives the keyboard back.
+            if not self._layered:
+                Gdk.Display.get_default().get_default_seat().ungrab()
             self._grabbed = False
             # The hotkey's own modifier was down when we grabbed, so its
             # release was swallowed. Lift it or the desktop behaves as though

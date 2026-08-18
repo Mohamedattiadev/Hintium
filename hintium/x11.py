@@ -13,6 +13,8 @@ breaking.
 
 import ctypes
 import ctypes.util
+import os
+import shutil
 import subprocess
 import sys
 import time
@@ -46,6 +48,52 @@ class _XWindowAttributes(ctypes.Structure):
         ("override_redirect", ctypes.c_int),
         ("screen", ctypes.c_void_p),
     ]
+
+
+class _XErrorEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("serial", ctypes.c_ulong),
+        ("error_code", ctypes.c_ubyte),
+        ("request_code", ctypes.c_ubyte),
+        ("minor_code", ctypes.c_ubyte),
+        ("resourceid", ctypes.c_ulong),
+    ]
+
+
+_XErrorHandler = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_XErrorEvent))
+
+# Kept alive deliberately: ctypes does not hold a reference to a callback
+# once XSetErrorHandler has it, and a garbage-collected one crashes the
+# process the moment the server actually reports an error.
+_error_handler_ref = None
+
+
+def _on_x_error(_display, event):
+    """Replace Xlib's default handler, which calls exit() on any error.
+
+    Every request this module makes is one a stale or already-gone window id
+    can turn into a protocol error -- routine under a Wayland compositor,
+    where _NET_ACTIVE_WINDOW on the rootless XWayland display answers with a
+    window id for whatever is focused even when that is a native-Wayland
+    client with no real X window behind it at all. The default handler's
+    exit() turned that into the whole daemon dying on the next keypress,
+    which is what "works on X11, dies immediately under Hyprland" actually
+    was -- every call site downstream already treats a failed request as
+    "no data" (checked via a status code or a null pointer), so surviving
+    the error is all that was ever needed.
+    """
+    try:
+        error = event.contents
+        debug_log(
+            f"X error ignored: code={error.error_code} "
+            f"request={error.request_code}.{error.minor_code} "
+            f"resource=0x{error.resourceid:x}")
+    except Exception:
+        pass
+    return 0
 
 
 class _XClientMessageEvent(ctypes.Structure):
@@ -87,6 +135,12 @@ def _load():
         display = x11.XOpenDisplay(None)
         if not display:
             return False
+
+        global _error_handler_ref
+        x11.XSetErrorHandler.argtypes = [_XErrorHandler]
+        x11.XSetErrorHandler.restype = ctypes.c_void_p
+        _error_handler_ref = _XErrorHandler(_on_x_error)
+        x11.XSetErrorHandler(_error_handler_ref)
 
         x11.XInternAtom.restype = ctypes.c_ulong
         x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
@@ -517,8 +571,72 @@ def sync():
     return True
 
 
+_WTYPE_MODIFIERS = {
+    "ctrl": "ctrl", "control": "ctrl", "shift": "shift",
+    "alt": "alt", "super": "logo",
+}
+
+_wtype_path = None
+
+
+def wayland_available():
+    """True if this is a Wayland session with wtype on PATH.
+
+    Cached after the first successful lookup -- shutil.which() is a PATH
+    scan, and send_combo() is a hot path in caret mode's letter-by-letter
+    navigation.
+    """
+    global _wtype_path
+    if _wtype_path is not None:
+        return True
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        return False
+    found = shutil.which("wtype")
+    if not found:
+        return False
+    _wtype_path = found
+    return True
+
+
+def _wtype_combo(combo):
+    """Send `combo` via wtype -- Wayland's own virtual-keyboard protocol.
+
+    XTest, forwarded through the rootless XWayland connection, reaches every
+    window for clicks and for releasing a stuck modifier (see
+    release_modifiers) -- confirmed live. It does not reliably reach a
+    native-Wayland window's own text input for a full key combo: measured
+    live, ctrl+a then ctrl+v via XTest left a native-Wayland field on Brave
+    completely unchanged -- no selection, no paste -- while the identical
+    combo through wtype landed every time. wtype speaks the protocol a
+    client's own input handling actually listens to at the compositor's seat
+    level, which reaches an XWayland-hosted window exactly as it reaches a
+    native one -- XWayland forwards real seat key events to its own X11
+    clients the same way it would relay them from a physical keyboard -- so
+    this replaces XTest for combos on any Wayland session rather than
+    running alongside it, which would otherwise fire every combo twice.
+    """
+    parts = combo.split("+")
+    mods, key = parts[:-1], parts[-1]
+    argv = [_wtype_path]
+    for mod in mods:
+        argv += ["-M", _WTYPE_MODIFIERS.get(mod.lower(), mod.lower())]
+    argv += ["-k", key]
+    for mod in reversed(mods):
+        argv += ["-m", _WTYPE_MODIFIERS.get(mod.lower(), mod.lower())]
+    try:
+        subprocess.run(argv, timeout=2, check=False, capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
 def send_combo(combo):
-    """Send something like 'shift+ctrl+Right' via XTest."""
+    """Send something like 'shift+ctrl+Right' -- via wtype on Wayland,
+    XTest otherwise. See _wtype_combo's docstring for why the two are not
+    both tried on the same call.
+    """
+    if wayland_available():
+        return _wtype_combo(combo)
     if not _load() or _xtst is None:
         return False
     parts = combo.split("+")

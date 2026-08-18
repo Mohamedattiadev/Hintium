@@ -286,11 +286,15 @@ OPTIONAL_BINARIES = {
     "nvim": "edit mode's warm server; any $EDITOR works without it",
 }
 TYPELIBS = {
-    ("Atspi", "2.0"): ("at-spi2-core", "reading the accessibility tree"),
-    ("Gtk", "3.0"): ("gtk3", "the overlay"),
-    ("Gdk", "3.0"): ("gtk3", "screen geometry"),
+    ("Atspi", "2.0"): ("at-spi2-core", "reading the accessibility tree", True),
+    ("Gtk", "3.0"): ("gtk3", "the overlay", True),
+    ("Gdk", "3.0"): ("gtk3", "screen geometry", True),
     ("Vte", "2.91"): ("vte3", "edit mode only; every other mode works "
-                              "without it"),
+                              "without it", False),
+    ("GtkLayerShell", "0.1"): (
+        "gtk-layer-shell", "keeps the overlay full-screen under a wlroots "
+        "Wayland compositor (Hyprland, Sway); without it a tiling one tiles "
+        "it like any other window. Not used at all on X11", False),
 }
 
 
@@ -340,18 +344,18 @@ def do_doctor():
                       required=False)
 
     print("\ntypelibs")
-    for (namespace, version), (package, why) in TYPELIBS.items():
+    for (namespace, version), (package, why, required) in TYPELIBS.items():
         if gi is None:
-            doctor.report(False, namespace, why, f"install {package}")
+            doctor.report(False, namespace, why, f"install {package}",
+                          required=required)
             continue
         try:
             gi.require_version(namespace, version)
             __import__("gi.repository", fromlist=[namespace])
             doctor.report(True, namespace, f"{version} -- {why}")
         except (ImportError, ValueError):
-            doctor.report(namespace == "Vte", namespace, why,
-                          f"install {package}",
-                          required=namespace != "Vte")
+            doctor.report(False, namespace, why, f"install {package}",
+                          required=required)
 
     print("\nlibraries")
     for library, why in (("X11", "window and pointer queries, through ctypes"),

@@ -199,6 +199,12 @@ SCROLL_PROBE_SEARCH = 40
 # as that window's frame, in pixels of total edge difference.
 FRAME_MATCH_TOLERANCE = 80
 
+# Below this, a frame's own reported SCREEN position and the window
+# manager's are treated as agreeing -- normal rounding/border noise, not
+# Chromium's native-Wayland bug (see elements._screen_delta), which is
+# never this small.
+SCREEN_DELTA_TOLERANCE = 5
+
 # A nested region this close in area to the one containing it is the same
 # scroller. A page's content column sits inside the viewport pane at roughly
 # half its area and scrolls exactly with it, so 0.75 left both on offer.

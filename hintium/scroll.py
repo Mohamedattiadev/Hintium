@@ -20,8 +20,8 @@ from gi.repository import Atspi, Gdk, GLib, Gtk  # noqa: E402
 
 from . import config, elements, theme, x11  # noqa: E402
 from .overlay import (  # noqa: E402
-    badge, draw_legend, keys, mode_switch, normalize_key, screen_size,
-    set_identity,
+    badge, draw_legend, init_fullscreen_layer, keys, mode_switch,
+    normalize_key, screen_size, set_identity,
 )
 
 WHEEL_UP, WHEEL_DOWN = 4, 5
@@ -99,6 +99,17 @@ def _collect(screen_w, screen_h, origin=None):
     frame = elements.active_frame(app, (win_x, win_y, win_w, win_h))
     scope = frame if frame is not None else app
 
+    # See elements._screen_delta's docstring.
+    reference = frame
+    if reference is None:
+        try:
+            if app.get_child_count() >= 1:
+                reference = app.get_child_at_index(0)
+        except Exception:
+            reference = None
+    delta = elements._screen_delta(reference, win_x, win_y) \
+        if reference is not None else (0, 0)
+
     collection = scope.get_collection_iface()
     if collection is None:
         return []
@@ -125,7 +136,8 @@ def _collect(screen_w, screen_h, origin=None):
 
     matches = query(config.SCROLL_ROLES)
     seen = set()
-    candidates = _shape(matches, win_x, win_y, left, top, right, bottom, seen)
+    candidates = _shape(matches, win_x, win_y, left, top, right, bottom, seen,
+                        delta)
 
     def sift(items):
         # Test the biggest first and stop after a fixed number: every overflow
@@ -150,7 +162,7 @@ def _collect(screen_w, screen_h, origin=None):
     # never looked at. The cost is real but a missing sidebar is worse.
     if time.monotonic() < deadline:
         extra = _shape(query(config.SCROLL_ROLES_FALLBACK), win_x, win_y,
-                       left, top, right, bottom, seen)
+                       left, top, right, bottom, seen, delta)
         regions += sift(extra)
     else:
         extra = []
@@ -489,10 +501,11 @@ def _contains(outer, inner):
             and outer.y + outer.h + margin >= inner.y + inner.h)
 
 
-def _shape(matches, win_x, win_y, left, top, right, bottom, seen):
+def _shape(matches, win_x, win_y, left, top, right, bottom, seen,
+           delta=(0, 0)):
     """Turn raw matches into sized, on-screen, de-duplicated candidates."""
     out = []
-    for acc, ext in elements._extents(matches, win_x, win_y):
+    for acc, ext in elements._extents(matches, win_x, win_y, delta):
         if ext.width < config.MIN_SCROLL_SIZE or \
                 ext.height < config.MIN_SCROLL_SIZE:
             continue
@@ -856,6 +869,13 @@ class ScrollSession:
         self.window.set_accept_focus(True)
         self.window.set_skip_taskbar_hint(True)
         self.window.set_skip_pager_hint(True)
+
+        # See overlay.init_fullscreen_layer()'s docstring: without this a
+        # tiling Wayland compositor tiles this window like any other one.
+        monitor_size = init_fullscreen_layer(self.window)
+        self._layered = monitor_size is not None
+        if self._layered:
+            self.width, self.height = monitor_size
         self.window.set_default_size(self.width, self.height)
 
         screen = Gdk.Screen.get_default()
@@ -879,9 +899,10 @@ class ScrollSession:
 
     def show(self):
         self.window.show_all()
-        self.window.move(0, 0)
-        self.window.resize(self.width, self.height)
-        self.window.fullscreen()
+        if not self._layered:
+            self.window.move(0, 0)
+            self.window.resize(self.width, self.height)
+            self.window.fullscreen()
         gdk_window = self.window.get_window()
         if gdk_window is not None:
             gdk_window.raise_()
@@ -906,6 +927,12 @@ class ScrollSession:
     # -- input ----------------------------------------------------------
 
     def _grab(self):
+        # See Overlay._grab: layer-shell already has exclusive keyboard
+        # interactivity the moment the surface is mapped.
+        if self._layered:
+            x11.release_modifiers()
+            self._grabbed = True
+            return False
         gdk_window = self.window.get_window()
         if gdk_window is not None:
             seat = Gdk.Display.get_default().get_default_seat()
@@ -1455,7 +1482,8 @@ class ScrollSession:
             GLib.source_remove(self._idle)
             self._idle = None
         if self._grabbed:
-            Gdk.Display.get_default().get_default_seat().ungrab()
+            if not self._layered:
+                Gdk.Display.get_default().get_default_seat().ungrab()
             self._grabbed = False
             # See Overlay._ungrab: a grab taken under a held modifier eats the
             # key-up, leaving the modifier logically stuck.

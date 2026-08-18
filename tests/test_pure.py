@@ -1757,6 +1757,7 @@ class EditBoxGrows(unittest.TestCase):
         from hintium import edit
         instance = object.__new__(edit.EditSession)
         instance.closed = False
+        instance._layered = False
         instance.field = Fake(x=10, y=10, w=400, h=30)
         instance._rows, instance._cell_h = rows, 23
         instance._chrome_px, instance._chrome_rows = 6, chrome

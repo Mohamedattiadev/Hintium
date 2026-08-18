@@ -406,9 +406,11 @@ class WorkspaceWatch(unittest.TestCase):
     def test_a_changed_workspace_dismisses_the_overlay(self):
         import unittest.mock
 
-        from hintium import service, x11
+        from hintium import hypr, service, x11
         instance = self.daemon(2)
-        with unittest.mock.patch.object(x11, "current_desktop",
+        with unittest.mock.patch.object(hypr, "available",
+                                        return_value=False), \
+             unittest.mock.patch.object(x11, "current_desktop",
                                         return_value=5), \
              unittest.mock.patch.object(service.Daemon, "_clear_mode"):
             keep_going = instance._check_workspace()
@@ -418,9 +420,11 @@ class WorkspaceWatch(unittest.TestCase):
     def test_the_same_workspace_leaves_it_alone(self):
         import unittest.mock
 
-        from hintium import x11
+        from hintium import hypr, x11
         instance = self.daemon(2)
-        with unittest.mock.patch.object(x11, "current_desktop",
+        with unittest.mock.patch.object(hypr, "available",
+                                        return_value=False), \
+             unittest.mock.patch.object(x11, "current_desktop",
                                         return_value=2):
             keep_going = instance._check_workspace()
         instance.overlay.dismiss.assert_not_called()
@@ -429,10 +433,12 @@ class WorkspaceWatch(unittest.TestCase):
     def test_no_overlay_stops_the_watch(self):
         import unittest.mock
 
-        from hintium import x11
+        from hintium import hypr, x11
         instance = self.daemon(2)
         instance.overlay = None
-        with unittest.mock.patch.object(x11, "current_desktop",
+        with unittest.mock.patch.object(hypr, "available",
+                                        return_value=False), \
+             unittest.mock.patch.object(x11, "current_desktop",
                                         return_value=5) as read:
             self.assertFalse(instance._check_workspace())
         read.assert_not_called()
@@ -440,12 +446,28 @@ class WorkspaceWatch(unittest.TestCase):
     def test_a_wm_that_publishes_no_desktop_is_not_treated_as_a_switch(self):
         import unittest.mock
 
-        from hintium import x11
+        from hintium import hypr, x11
         instance = self.daemon(2)
-        with unittest.mock.patch.object(x11, "current_desktop",
+        with unittest.mock.patch.object(hypr, "available",
+                                        return_value=False), \
+             unittest.mock.patch.object(x11, "current_desktop",
                                         return_value=None):
             self.assertTrue(instance._check_workspace())
         instance.overlay.dismiss.assert_not_called()
+
+    def test_a_changed_hyprland_workspace_dismisses_the_overlay(self):
+        import unittest.mock
+
+        from hintium import hypr, service
+        instance = self.daemon(2)
+        with unittest.mock.patch.object(hypr, "available",
+                                        return_value=True), \
+             unittest.mock.patch.object(hypr, "active_workspace_id",
+                                        return_value=5), \
+             unittest.mock.patch.object(service.Daemon, "_clear_mode"):
+            keep_going = instance._check_workspace()
+        instance.overlay.dismiss.assert_called_once()
+        self.assertFalse(keep_going)
 
 
 class CaretMinimumIsAPreference(unittest.TestCase):
@@ -474,7 +496,8 @@ class CaretMinimumIsAPreference(unittest.TestCase):
         class Field:
             w = h = 10
 
-        def shape(matches, wx, wy, left, top, right, bottom, min_chars, req):
+        def shape(matches, wx, wy, left, top, right, bottom, min_chars, req,
+                  delta=(0, 0)):
             seen.append(min_chars)
             return [Field()] if min_chars <= 1 else []
 

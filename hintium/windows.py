@@ -9,14 +9,15 @@ windows are on screen at once.
 import subprocess
 from dataclasses import dataclass
 
-from . import config, x11
+from . import config, hypr, x11
 
 
 @dataclass
 class WindowTarget:
     """A window to switch to. Mirrors elements.Element's geometry fields."""
 
-    window_id: int
+    # An X id on X11, a Hyprland address (a hex string) under Hyprland.
+    window_id: int | str
     name: str
     x: int
     y: int
@@ -117,6 +118,9 @@ def collect(screen_w, screen_h, exclude_id=None):
     if not config.HINT_WINDOWS:
         return []
 
+    if hypr.available():
+        return _collect_hyprland(exclude_id)
+
     if x11.available():
         return _collect_x11(screen_w, screen_h, exclude_id)
 
@@ -178,8 +182,23 @@ def _collect_x11(screen_w, screen_h, exclude_id):
     return targets
 
 
+def _collect_hyprland(exclude_id):
+    """Same as collect(), for a Hyprland session -- see hypr.clients().
+
+    hypr.clients() already applies the mapped/hidden/visible/size filtering
+    collect()'s x11 and xdotool paths have to do by hand, since Hyprland
+    tracks cross-workspace and cross-monitor visibility itself.
+    """
+    return [
+        WindowTarget(w.address, w.title, w.x, w.y, w.w, w.h)
+        for w in hypr.clients() if w.address != exclude_id
+    ]
+
+
 def activate(target):
     """Focus a window, switching group/workspace if the WM needs to."""
+    if isinstance(target.window_id, str):
+        return "activate" if hypr.activate(target.window_id) else "failed"
     if x11.available() and x11.activate_window(target.window_id):
         return "activate"
     try:

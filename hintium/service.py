@@ -19,8 +19,8 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Atspi, GLib, Gtk  # noqa: E402
 
 from . import (  # noqa: E402
-    caret, click, config, edit, elements, hints, overlay as overlay_module,
-    scroll, search, userconfig, windows, x11,
+    caret, click, config, edit, elements, hints, hypr,
+    overlay as overlay_module, scroll, search, userconfig, windows, x11,
 )
 from .overlay import Overlay, screen_size  # noqa: E402
 
@@ -193,7 +193,7 @@ class Daemon:
         only sensible thing is to stop.
         """
         self._unwatch_workspace()
-        self._desktop = x11.current_desktop()
+        self._desktop = _current_desktop()
         if self._desktop is None:
             return                       # WM publishes no desktop; nothing to watch
         self._desktop_watch = GLib.timeout_add(
@@ -208,7 +208,7 @@ class Daemon:
         if self.overlay is None:
             self._desktop_watch = None
             return False
-        now = x11.current_desktop()
+        now = _current_desktop()
         if now is not None and now != self._desktop:
             self._log(f"workspace changed ({self._desktop} -> {now}); "
                       f"closing the open mode")
@@ -849,15 +849,30 @@ def _native_caret_key():
     return None
 
 
-def _active_window_id():
-    """X id of the focused window, so it is not offered as a switch target.
+def _current_desktop():
+    """The workspace on screen, Hyprland's or X11's, or None.
 
+    None means "the session publishes no such thing", not "unavailable" --
+    see x11.current_desktop() and hypr.active_workspace_id().
+    """
+    if hypr.available():
+        return hypr.active_workspace_id()
+    return x11.current_desktop()
+
+
+def _active_window_id():
+    """Id of the focused window, so it is not offered as a switch target.
+
+    A Hyprland address (str) under Hyprland, an X id (int) otherwise.
     x11.active_window_id() is the same ctypes call elements.active_window()
     already made a moment earlier in the same request (~0.3ms); shelling out
     to xdotool here as well cost an extra ~10-30ms process spawn on every
     single hint press for no new information, so that fallback is now only
     used on the systems where the ctypes binding is unavailable.
     """
+    if hypr.available():
+        window = hypr.active_window()
+        return window.address if window is not None else None
     if x11.available():
         return x11.active_window_id()
     import subprocess

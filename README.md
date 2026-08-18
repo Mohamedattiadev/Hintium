@@ -51,11 +51,14 @@ add to your nvim config.
 ```sh
 # Arch; the names differ elsewhere, the libraries do not
 sudo pacman -S at-spi2-core python-gobject libx11 libxtst \
-               xdotool xclip openbsd-netcat vte3
+               xdotool xclip openbsd-netcat vte3 gtk-layer-shell
 ```
 
 `vte3` is edit mode only and imported lazily — without it the other five modes
-still work. Nothing to build.
+still work. `gtk-layer-shell` matters only on a wlroots Wayland compositor
+(Hyprland, Sway) — without it there the overlay is a plain window and a
+tiling compositor tiles it like any other one instead of covering the
+screen; X11 never touches it. Nothing to build.
 
 ```sh
 git clone https://github.com/Mohamedattiadev/Hintium ~/hintium
@@ -77,6 +80,17 @@ Key([mod2], "slash",        lazy.spawn(HINTIUM + " --search")),
 Key([mod2], "c",            lazy.spawn(HINTIUM + " --caret")),
 Key([mod2, "shift"], "c",   lazy.spawn(HINTIUM + " --caret-search")),
 Key([mod2], "e",            lazy.spawn(HINTIUM + " --edit")),
+```
+
+Hyprland:
+
+```
+bind = ALT, space,        exec, ~/hintium/bin/hintium
+bind = ALT, j,             exec, ~/hintium/bin/hintium --scroll
+bind = ALT, slash,         exec, ~/hintium/bin/hintium --search
+bind = ALT, c,             exec, ~/hintium/bin/hintium --caret
+bind = ALT SHIFT, c,       exec, ~/hintium/bin/hintium --caret-search
+bind = ALT, e,             exec, ~/hintium/bin/hintium --edit
 ```
 
 That is the only file of yours hintium asks you to touch.
@@ -177,6 +191,19 @@ Measured over 15 real sites: 91 hints per page at ~200ms, 1.9 scroll regions,
   may get nothing.
 - **JS-heavy apps expose invisible elements** as showing, with real
   coordinates and names.
+- **Wayland support is two separate things, and only one is Hyprland-only.**
+  The overlay (every mode's fullscreen window) uses `gtk-layer-shell` and
+  works on any wlroots compositor -- Sway included, not just Hyprland.
+  Window switching, activation and geometry go through `hyprctl`, which is
+  Hyprland-specific; every click and keystroke still goes through XTest on
+  the rootless XWayland display, which wlroots forwards into the real
+  compositor seat regardless of whether the focused window is XWayland or
+  native. On a wlroots compositor other than Hyprland the overlay still
+  covers the screen correctly, but window switching falls back to the
+  X11/xdotool path, which only sees XWayland windows. A layer-shell surface
+  belongs to exactly one monitor by protocol design, so it is pinned to
+  whichever one the pointer is on -- untested on more than one, since this
+  project's only monitor is a single 1366x768 panel.
 
 ## Tests
 

@@ -778,6 +778,48 @@ def ydotool_click(button, modifiers=(), hold_ms=0):
     return result.returncode == 0
 
 
+# X11 button 4/5/6/7 (up/down/left/right) -> ydotool's wheel axes. Confirmed
+# live against qutebrowser: negative -y scrolled the page down (content moved
+# up), so down/right -- "forward" -- are the negative direction here; left/up
+# are the unverified mirror of that, not measured separately.
+_YDOTOOL_WHEEL_DELTA = {
+    4: (0, 1), 5: (0, -1), 6: (1, 0), 7: (-1, 0),
+}
+
+
+def ydotool_wheel(button, times):
+    """Scroll the wheel `times` clicks in `button`'s direction via ydotool.
+
+    Same reason as ydotool_click: scroll.py's own wheel events go through
+    XTestFakeButtonEvent otherwise, which reaches an XWayland window but not
+    a native-Wayland one at all (see this module's own docstring above).
+    One call scaled by `times` rather than `times` separate ones -- a gg/G
+    edge jump asks for hundreds of clicks, and that many ydotool subprocess
+    spawns would cost seconds XTest's own server-side delay_ms never did.
+
+    The scale factor is a real measurement, not a guess dressed as one: -1
+    alone produced no visible movement in a screenshot diff, -3 produced
+    roughly what a single physical wheel notch does, -10 several lines
+    more -- linear, just finer-grained than the "1 unit = 1 notch" XTest's
+    discrete Button4/5 and a real wheel both use.
+    """
+    if not ydotool_available():
+        return False
+    delta = _YDOTOOL_WHEEL_DELTA.get(button)
+    if delta is None:
+        return False
+    dx, dy = delta
+    scale = times * 3
+    try:
+        result = subprocess.run(
+            [_ydotool_path, "mousemove", "-w",
+             "-x", str(dx * scale), "-y", str(dy * scale)],
+            timeout=2, check=False, capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def fallback_run(argv, timeout=2):
     try:
         subprocess.run(argv, timeout=timeout, check=False,

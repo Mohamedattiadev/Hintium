@@ -64,12 +64,15 @@ screen; X11 never touches it. Nothing to build.
 **On Wayland, two more matter.** XTest — everything above uses it — is
 forwarded through the rootless XWayland connection, and reaches an
 XWayland-hosted window fine. It does not reach a native-Wayland one at all:
-confirmed live against qutebrowser on Hyprland, neither a key combo nor a
-click landed, with no error either. `wtype` (`sudo pacman -S wtype`) is what
-key combos fall back to on any wlroots compositor, no setup beyond having it
-on PATH. Clicks need `ydotool` — real kernel-level input via `/dev/uinput`,
-indistinguishable from a physical mouse — paired with `hyprctl dispatch
-movecursor` for positioning, so this half is Hyprland-specific:
+confirmed live against qutebrowser on Hyprland, neither a key combo, a click
+nor a scroll wheel event landed, with no error either. `wtype`
+(`sudo pacman -S wtype`) is what key combos fall back to on any wlroots
+compositor, no setup beyond having it on PATH. Clicks and scrolling need
+`ydotool` — real kernel-level input via `/dev/uinput`, indistinguishable from
+a physical mouse — paired with `hyprctl dispatch movecursor` for positioning
+(`XWarpPointer` moves only XWayland's own separate virtual pointer, confirmed
+live to leave the real one wherever it already was), so this half is
+Hyprland-specific:
 
 ```sh
 sudo pacman -S ydotool
@@ -217,16 +220,21 @@ Measured over 15 real sites: 91 hints per page at ~200ms, 1.9 scroll regions,
   just Hyprland. Key combos fall back to `wtype` on any wlroots compositor
   too. Window switching, activation and geometry go through `hyprctl`, which
   is Hyprland-specific; on another wlroots compositor that falls back to the
-  X11/xdotool path, which only sees XWayland windows. Clicking is
-  Hyprland-only for a harder reason: XTestFakeButtonEvent does not reach a
-  native-Wayland window *at all* -- confirmed live against qutebrowser, not a
-  coordinate bug, the click simply never arrives -- so it needs a real
-  pointer move (`hyprctl dispatch movecursor`, since `XWarpPointer` only
-  moves XWayland's own separate virtual pointer) paired with a real button
-  event (`ydotool`, kernel-level `/dev/uinput`). Neither has a
+  X11/xdotool path, which only sees XWayland windows. Clicking and scrolling
+  are Hyprland-only for a harder reason: XTestFakeButtonEvent does not reach
+  a native-Wayland window *at all* -- confirmed live against qutebrowser, not
+  a coordinate bug, neither a click nor a wheel event ever arrives -- so both
+  need a real pointer move (`hyprctl dispatch movecursor`, since
+  `XWarpPointer` only moves XWayland's own separate virtual pointer, and
+  `XQueryPointer` only ever reads that same fake position back -- confirmed
+  live to be *why* scroll mode's own "which region is under the pointer"
+  pick was routinely wrong: it was asking XWayland's stale answer, not the
+  real one `hyprctl cursorpos` agreed with) paired with a real button or
+  wheel event (`ydotool`, kernel-level `/dev/uinput`). Neither has a
   generic-wlroots equivalent installed here, so on a compositor other than
-  Hyprland a click on a native-Wayland window silently lands nowhere -- the
-  same failure this fixed on Hyprland, just without the fix. A layer-shell
+  Hyprland a click or scroll on a native-Wayland window silently lands
+  nowhere -- the same failure this fixed on Hyprland, just without the fix.
+  A layer-shell
   surface belongs to exactly one monitor by protocol design, so it is pinned
   to whichever one the pointer is on -- untested on more than one, since this
   project's only monitor is a single 1366x768 panel.

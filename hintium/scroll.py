@@ -18,7 +18,7 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Atspi, Gdk, GLib, Gtk  # noqa: E402
 
-from . import config, elements, theme, x11  # noqa: E402
+from . import config, elements, hypr, theme, x11  # noqa: E402
 from .overlay import (  # noqa: E402
     badge, draw_legend, init_fullscreen_layer, keys, mode_switch,
     normalize_key, screen_size, set_identity,
@@ -579,6 +579,16 @@ def _overflows(region):
 
 
 def _wheel(x, y, button, times):
+    # XTestFakeButtonEvent -- what x11.click() and the xdotool fallback below
+    # both send -- never reaches a native-Wayland window at all (see
+    # x11.ydotool_wheel's own docstring), which is why nothing scrolled on
+    # Hyprland before this branch existed. One ydotool call handles the
+    # whole `times` count itself, so there is no pacing loop to write here
+    # the way _wheel_paced needs one for XTest.
+    if hypr.available() and x11.ydotool_available():
+        if hypr.move_cursor(x, y) and x11.ydotool_wheel(button, times):
+            return
+
     # sync=False: see x11.click's docstring.
     if x11.available() and x11.click(button, x, y, times=times,
                                      delay_ms=config.SCROLL_CLICK_DELAY,
@@ -615,7 +625,16 @@ def _wheel_paced(x, y, button, times):
     the probes in verify()/_scrolls() still use _wheel() -- they explicitly
     sleep and re-check afterward, so the extra few milliseconds of being
     server-paced for just two clicks was never the problem there.
+
+    Not relevant to the ydotool path this tries first: a single ydotool call
+    already carries the whole `times` count (see x11.ydotool_wheel), so
+    there is no per-event server queue here to drain slowly in the first
+    place. That path returns before any of the pacing below runs.
     """
+    if hypr.available() and x11.ydotool_available():
+        if hypr.move_cursor(x, y) and x11.ydotool_wheel(button, times):
+            return
+
     if not x11.available():
         _wheel(x, y, button, times)
         return
@@ -1577,7 +1596,18 @@ def _rounded(cr, x, y, w, h, radius):
 
 
 def _pointer_position():
-    # In-process ctypes first, same as click.py -- this runs on entering and
+    # hyprctl first on Hyprland: x11.pointer_position() (XQueryPointer) reads
+    # XWayland's own separate virtual pointer, not the compositor's real one
+    # -- confirmed live, it answered (447,354) while hyprctl cursorpos and the
+    # visible cursor both agreed on (865,390), a difference that fell inside
+    # a completely different scroll region and is exactly why best() was
+    # choosing a small sidebar list over the real content pane it was clearly
+    # sitting over (see hypr.cursor_position's own docstring).
+    if hypr.available():
+        position = hypr.cursor_position()
+        if position:
+            return position
+    # In-process ctypes next, same as click.py -- this runs on entering and
     # leaving every scroll session, so a ~10-30ms xdotool spawn here was
     # visible as a stutter each time, not just a latency number. xdotool is
     # the fallback for a system without libX11 bound, not the normal path.
@@ -1602,6 +1632,11 @@ def _pointer_position():
 
 
 def _restore_pointer(origin):
+    # hyprctl first on Hyprland, for the same reason _pointer_position()
+    # reads it first: XWarpPointer moves only XWayland's own virtual pointer,
+    # confirmed live to leave the real, visible cursor exactly where it was.
+    if hypr.available() and hypr.move_cursor(*origin):
+        return
     if x11.available() and x11.warp_pointer(*origin):
         return
     try:

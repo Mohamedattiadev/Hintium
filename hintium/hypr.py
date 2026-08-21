@@ -154,6 +154,23 @@ def move_cursor(x, y):
         return False
 
 
+def move_cursor_async(x, y):
+    """Fire-and-forget move_cursor -- see x11.ydotool_wheel_async's own
+    docstring for why the interactive scroll path needs this instead of the
+    blocking version above: a held key's GTK key-press handler cannot afford
+    to wait out a subprocess round trip on every repeat, and this is the
+    other half of the pair (hyprctl move, then ydotool wheel) that path
+    fires each tick.
+    """
+    try:
+        subprocess.Popen(
+            [_HYPRCTL, "dispatch", "movecursor", str(int(x)), str(int(y))],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def active_workspace_id():
     """The workspace on screen, or None -- see x11.current_desktop()."""
     data = _query(["activeworkspace"])

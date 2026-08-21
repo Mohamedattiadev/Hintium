@@ -626,13 +626,24 @@ def _wheel_paced(x, y, button, times):
     sleep and re-check afterward, so the extra few milliseconds of being
     server-paced for just two clicks was never the problem there.
 
-    Not relevant to the ydotool path this tries first: a single ydotool call
-    already carries the whole `times` count (see x11.ydotool_wheel), so
-    there is no per-event server queue here to drain slowly in the first
-    place. That path returns before any of the pacing below runs.
+    A single ydotool call already carries the whole `times` count (see
+    x11.ydotool_wheel), so there is no per-event server queue here to drain
+    slowly the way there is for XTest -- but the *_async fire-and-forget
+    variants are still what this reaches for, not the plain ones _wheel()
+    uses. This runs on the same GTK key-press handler a held key re-enters
+    every ~25-40ms of autorepeat, and subprocess.run() blocks that handler
+    until the spawned process exits -- two real spawns (hyprctl then
+    ydotool) easily cost more than that window. Confirmed live: with the
+    blocking calls here, a genuinely held key produced exactly the "feels
+    laggy, then catches up" symptom the paragraph above already describes
+    for XTest's server-side delay, just from Python's own subprocess wait
+    instead. Popen without waiting keeps this handler as cheap as XTest's
+    tick() below always was, at the cost of not knowing whether either call
+    actually landed -- tick() does not know that either.
     """
     if hypr.available() and x11.ydotool_available():
-        if hypr.move_cursor(x, y) and x11.ydotool_wheel(button, times):
+        hypr.move_cursor_async(x, y)
+        if x11.ydotool_wheel_async(button, times):
             return
 
     if not x11.available():

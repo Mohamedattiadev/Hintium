@@ -820,6 +820,40 @@ def ydotool_wheel(button, times):
     return result.returncode == 0
 
 
+def ydotool_wheel_async(button, times):
+    """Fire-and-forget wheel scroll -- see ydotool_wheel for the mechanism.
+
+    subprocess.run() blocks the caller until the process exits, which is
+    fine for the couple of probe scrolls verify()/_scrolls() send, and wrong
+    for the interactive path: a held key repeats at the X11/GTK level every
+    ~25-40ms, that call runs on the same GTK key-press handler that also has
+    to keep the overlay responding, and a real ydotool spawn plus the
+    hyprctl one that precedes it (see hypr.move_cursor_async) together cost
+    more than that window -- confirmed live, this is what "scrolling barely
+    moves, then catches up" under a genuinely held key turned out to be,
+    same shape as the server-side delay_ms problem _wheel_paced's own
+    docstring already describes for XTest. Popen without waiting keeps each
+    keystroke's handler as cheap as XTest's own fire-and-forget always was;
+    there is deliberately no way to know here whether it landed, matching
+    _wheel_paced's tick() for XTest, which does not check either.
+    """
+    if not ydotool_available():
+        return False
+    delta = _YDOTOOL_WHEEL_DELTA.get(button)
+    if delta is None:
+        return False
+    dx, dy = delta
+    scale = times * 3
+    try:
+        subprocess.Popen(
+            [_ydotool_path, "mousemove", "-w",
+             "-x", str(dx * scale), "-y", str(dy * scale)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return False
+    return True
+
+
 def fallback_run(argv, timeout=2):
     try:
         subprocess.run(argv, timeout=timeout, check=False,

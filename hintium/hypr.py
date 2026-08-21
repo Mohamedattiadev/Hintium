@@ -34,6 +34,7 @@ class Window:
     y: int
     w: int
     h: int
+    xwayland: bool = False
 
 
 def available():
@@ -60,7 +61,8 @@ def _window(data):
         x, y = data["at"]
         w, h = data["size"]
         return Window(data["address"], data["pid"],
-                     data.get("title", ""), x, y, w, h)
+                     data.get("title", ""), x, y, w,
+                     h, bool(data.get("xwayland", False)))
     except (KeyError, TypeError, ValueError):
         return None
 

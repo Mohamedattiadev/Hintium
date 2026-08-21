@@ -740,8 +740,23 @@ class Daemon:
 
     def _choose(self, element, button, modifiers):
         method = click.perform(element, button, modifiers)
-        self._log(f"clicked button={button} mods={modifiers} via {method}")
+        self._log(f"clicked button={button} mods={modifiers} via {method} "
+                  f"at {element.center}{self._surface_kind()}")
         self._release_chord_if_done(element)
+
+    def _surface_kind(self):
+        """" (xwayland)" / " (native)" on Hyprland; "" everywhere else.
+
+        A click landing via XTest can differ in reliability depending on
+        whether the focused window is XWayland-backed or drawn natively --
+        this makes that distinction visible in the log instead of guessed at.
+        """
+        if not hypr.available():
+            return ""
+        window = hypr.active_window()
+        if window is None:
+            return ""
+        return " (xwayland)" if window.xwayland else " (native)"
 
     def _release_chord_if_done(self, element):
         """Leave the qtile chord on a text field, or a switch to another window.

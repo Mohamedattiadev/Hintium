@@ -1,13 +1,14 @@
 # hintium
 
-Keyboard control of the whole desktop on X11 — click anything, scroll
-anything, search anything, put a cursor in text. Modelled on
+Keyboard control of the whole desktop on X11 and Wayland — click anything,
+scroll anything, search anything, put a cursor in text. Modelled on
 [Homerow](https://homerow.app) for macOS, backed by **AT-SPI2**, so hints land
 on real elements with real bounds rather than guessed rectangles.
 
 ![demo](docs/demo.gif)
 
-Built and used on Arch + qtile + picom, Python 3.14.
+Built and used on Arch + qtile + picom (X11), and on Hyprland (Wayland),
+Python 3.14. See [Limits](#limits) for exactly what Wayland support covers.
 
 ## Modes
 

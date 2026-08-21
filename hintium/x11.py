@@ -602,18 +602,21 @@ def _wtype_combo(combo):
     """Send `combo` via wtype -- Wayland's own virtual-keyboard protocol.
 
     XTest, forwarded through the rootless XWayland connection, reaches every
-    window for clicks and for releasing a stuck modifier (see
-    release_modifiers) -- confirmed live. It does not reliably reach a
-    native-Wayland window's own text input for a full key combo: measured
-    live, ctrl+a then ctrl+v via XTest left a native-Wayland field on Brave
-    completely unchanged -- no selection, no paste -- while the identical
-    combo through wtype landed every time. wtype speaks the protocol a
-    client's own input handling actually listens to at the compositor's seat
-    level, which reaches an XWayland-hosted window exactly as it reaches a
-    native one -- XWayland forwards real seat key events to its own X11
-    clients the same way it would relay them from a physical keyboard -- so
-    this replaces XTest for combos on any Wayland session rather than
-    running alongside it, which would otherwise fire every combo twice.
+    window for releasing a stuck modifier (see release_modifiers) -- confirmed
+    live. It does not reliably reach a native-Wayland window's own text input
+    for a full key combo: measured live, ctrl+a then ctrl+v via XTest left a
+    native-Wayland field on Brave completely unchanged -- no selection, no
+    paste -- while the identical combo through wtype landed every time.
+    (Clicks turn out worse still: XTestFakeButtonEvent reaches no
+    native-Wayland window at all, not even for a plain click -- see
+    hypr.move_cursor and click()'s own use of ydotool.) wtype speaks the
+    protocol a client's own input handling actually listens to at the
+    compositor's seat level, which reaches an XWayland-hosted window exactly
+    as it reaches a native one -- XWayland forwards real seat key events to
+    its own X11 clients the same way it would relay them from a physical
+    keyboard -- so this replaces XTest for combos on any Wayland session
+    rather than running alongside it, which would otherwise fire every combo
+    twice.
     """
     parts = combo.split("+")
     mods, key = parts[:-1], parts[-1]
@@ -707,6 +710,72 @@ def click(button, x=None, y=None, modifiers=(), times=1, delay_ms=0,
         else:
             _x11.XFlush(_display)
     return True
+
+
+_YDOTOOL_BUTTONS = {1: 0x00, 2: 0x02, 3: 0x01}  # left, middle, right
+# linux/input-event-codes.h: KEY_LEFT{CTRL,SHIFT,ALT,META}. ydotool key takes
+# raw evdev keycodes, not X11 keysym names, so _MODIFIER_NAMES above (built
+# for _keycode's XStringToKeysym) does not apply here.
+_YDOTOOL_MODIFIER_CODES = {
+    "ctrl": 29, "control": 29, "shift": 42, "alt": 56, "super": 125,
+}
+
+_ydotool_path = None
+
+
+def ydotool_available():
+    """True if ydotoold is reachable through its client -- see click()'s own
+    module docstring for why this exists. Cached and gated the same way as
+    wtype's wayland_available(): a PATH scan is not worth repeating on a hot
+    path, and there is nothing to check for on an X11 session.
+    """
+    global _ydotool_path
+    if _ydotool_path is not None:
+        return True
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        return False
+    found = shutil.which("ydotool")
+    if not found:
+        return False
+    _ydotool_path = found
+    return True
+
+
+def ydotool_click(button, modifiers=(), hold_ms=0):
+    """Press+release `button` (with modifiers held) via ydotool.
+
+    A real kernel-level uinput event, indistinguishable to the compositor
+    from a physical mouse -- unlike XTestFakeButtonEvent, confirmed live to
+    reach a native-Wayland window (qutebrowser on Hyprland: title changed on
+    every attempt through this path, never once through XTest, with or
+    without a preceding XWarpPointer). The caller positions the pointer first
+    -- see hypr.move_cursor -- because ydotool has no reliable absolute-move
+    mode on this build: its --touch-on flag, needed for one, crashes ydotoold
+    outright (measured live, no output, exit code 2), and its relative-move
+    mode is warped by whatever pointer-acceleration curve is configured, so
+    neither lands on a specific pixel reliably.
+    """
+    if not ydotool_available():
+        return False
+    codes = [_YDOTOOL_MODIFIER_CODES.get(m.lower()) for m in modifiers]
+    if any(code is None for code in codes):
+        return False
+    click_code = _YDOTOOL_BUTTONS.get(button)
+    if click_code is None:
+        return False
+    try:
+        for code in codes:
+            fallback_run([_ydotool_path, "key", f"{code}:1"])
+        result = subprocess.run(
+            [_ydotool_path, "click", "-D", str(hold_ms),
+             f"{click_code | 0xC0:#x}"],
+            timeout=2, check=False, capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        for code in reversed(codes):
+            fallback_run([_ydotool_path, "key", f"{code}:0"])
+    return result.returncode == 0
 
 
 def fallback_run(argv, timeout=2):

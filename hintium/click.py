@@ -8,7 +8,7 @@ import gi
 gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi  # noqa: E402
 
-from . import config, x11  # noqa: E402
+from . import config, hypr, x11  # noqa: E402
 
 BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT = 1, 2, 3
 
@@ -67,6 +67,26 @@ def _atspi_click(element):
 
 def _pointer_click(element, button, modifiers):
     x, y = element.center
+
+    if hypr.available() and x11.ydotool_available():
+        # XTestFakeButtonEvent never reaches a native-Wayland window at all
+        # (see x11.ydotool_click's own docstring) -- this is what actually
+        # lands a click on Hyprland, XWayland-backed windows included, since
+        # it moves and clicks through the compositor's real seat instead of
+        # XWayland's own separate virtual one. The origin comes from hyprctl
+        # rather than _pointer_position() below for the same reason: that
+        # reads the same fake XWayland state move_cursor never touches, so
+        # restoring to it would silently leave the real pointer wherever it
+        # already was.
+        origin = hypr.cursor_position()
+        if hypr.move_cursor(x, y):
+            time.sleep(config.CLICK_PREPRESS_MS / 1000)
+            if x11.ydotool_click(button, modifiers,
+                                 hold_ms=config.CLICK_HOLD_MS):
+                if origin:
+                    time.sleep(config.CLICK_SETTLE_MS / 1000)
+                    hypr.move_cursor(*origin)
+                return "ydotool"
 
     # Restoring the pointer keeps hover states and drag targets from being
     # disturbed by a click the user made with the keyboard.

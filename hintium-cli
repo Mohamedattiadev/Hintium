@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hintium -- keyboard control of an X11 desktop, over AT-SPI.
+"""hintium -- keyboard control of an X11 or Wayland desktop, over AT-SPI.
 
 The whole command surface lives here. `hintium` is a short shell script in
 front of it that handles the one case where startup cost is visible -- asking
@@ -377,7 +377,7 @@ def do_doctor():
     print("\nsession")
     display = os.environ.get("DISPLAY")
     doctor.report(bool(display), "DISPLAY", display or "not set",
-                  "hintium is X11 only")
+                  "every mode needs an X or XWayland display")
     try:
         answer = subprocess.run(
             ["gsettings", "get", "org.gnome.desktop.interface",
@@ -395,6 +395,49 @@ def do_doctor():
                       else "GTK applications publish nothing",
                       "gsettings set org.gnome.desktop.interface "
                       "toolkit-accessibility true")
+
+    if os.environ.get("WAYLAND_DISPLAY"):
+        print("\nwayland")
+        print("     XTest reaches an XWayland-hosted window but not a")
+        print("     native-Wayland one, confirmed live: neither a key combo")
+        print("     nor a click landed on native windows through it. wtype")
+        print("     and ydotool are what these fall back to instead.")
+        wtype = shutil.which("wtype")
+        doctor.report(bool(wtype), "wtype", wtype or
+                      "key combos (e.g. ctrl+v) on a native-Wayland window",
+                      "install wtype", required=False)
+        ydotool = shutil.which("ydotool")
+        doctor.report(bool(ydotool), "ydotool", ydotool or
+                      "clicks on a native-Wayland window",
+                      "install ydotool", required=False)
+        if ydotool:
+            runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+            ydotool_socket = os.path.join(runtime, ".ydotool_socket")
+            reachable = False
+            try:
+                # SOCK_DGRAM: ydotoold's socket is a datagram one, unlike
+                # hintium's own (see service.is_running) -- connect() with
+                # the wrong socket type fails immediately with ENOTSOCK's
+                # cousin EPROTOTYPE rather than ever finding out.
+                with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as probe:
+                    probe.settimeout(0.5)
+                    probe.connect(ydotool_socket)
+                    reachable = True
+            except OSError:
+                pass
+            doctor.report(reachable, "ydotoold", ydotool_socket if reachable
+                          else "not answering; clicks fall back to XTest, "
+                          "which misses native-Wayland windows",
+                          "systemctl --user enable --now ydotool, after "
+                          "adding yourself to the input group: "
+                          "usermod -aG input $USER, then log out and in",
+                          required=False)
+        if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            hyprctl = shutil.which("hyprctl")
+            doctor.report(bool(hyprctl), "hyprctl", hyprctl or
+                          "window switching, and positioning ydotool's "
+                          "clicks -- XWarpPointer cannot, confirmed live",
+                          "install hyprland's own tools", required=False)
 
     print("\nchromium and electron")
     print("     Each reads its own flags file, and publishes nothing to")

@@ -1434,11 +1434,18 @@ class EditorLeavesOnWorkspaceChange(unittest.TestCase):
     def test_the_daemon_reports_a_kept_buffer(self):
         import unittest.mock
 
-        from hintium import service, x11
+        from hintium import hypr, service, x11
         overlay = unittest.mock.Mock(spec=["close_for_workspace"])
         overlay.close_for_workspace.return_value = "/tmp/hintium-x.txt"
         instance = WorkspaceWatch.daemon(self, 2, overlay)
-        with unittest.mock.patch.object(x11, "current_desktop",
+        # Without this, _current_desktop() prefers hypr.active_workspace_id()
+        # whenever hypr.available() is genuinely true -- true on any real
+        # Hyprland session -- which reaches past the x11.current_desktop
+        # mock below to the real workspace number instead, making this test
+        # pass or fail by coincidence of whichever workspace it runs on.
+        with unittest.mock.patch.object(hypr, "available",
+                                        return_value=False), \
+             unittest.mock.patch.object(x11, "current_desktop",
                                         return_value=5), \
              unittest.mock.patch.object(service, "_notify") as told:
             instance._check_workspace()

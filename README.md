@@ -61,6 +61,25 @@ still work. `gtk-layer-shell` matters only on a wlroots Wayland compositor
 tiling compositor tiles it like any other one instead of covering the
 screen; X11 never touches it. Nothing to build.
 
+**On Wayland, two more matter.** XTest — everything above uses it — is
+forwarded through the rootless XWayland connection, and reaches an
+XWayland-hosted window fine. It does not reach a native-Wayland one at all:
+confirmed live against qutebrowser on Hyprland, neither a key combo nor a
+click landed, with no error either. `wtype` (`sudo pacman -S wtype`) is what
+key combos fall back to on any wlroots compositor, no setup beyond having it
+on PATH. Clicks need `ydotool` — real kernel-level input via `/dev/uinput`,
+indistinguishable from a physical mouse — paired with `hyprctl dispatch
+movecursor` for positioning, so this half is Hyprland-specific:
+
+```sh
+sudo pacman -S ydotool
+sudo usermod -aG input $USER   # log out and in for this to take effect
+systemctl --user enable --now ydotool
+```
+
+`hintium --doctor` checks all of this under its own `wayland` section, shown
+only when `$WAYLAND_DISPLAY` is set.
+
 ```sh
 git clone https://github.com/Mohamedattiadev/Hintium ~/hintium
 ~/hintium/bin/hintium --doctor
@@ -192,18 +211,24 @@ Measured over 15 real sites: 91 hints per page at ~200ms, 1.9 scroll regions,
   may get nothing.
 - **JS-heavy apps expose invisible elements** as showing, with real
   coordinates and names.
-- **Wayland support is two separate things, and only one is Hyprland-only.**
-  The overlay (every mode's fullscreen window) uses `gtk-layer-shell` and
-  works on any wlroots compositor -- Sway included, not just Hyprland.
-  Window switching, activation and geometry go through `hyprctl`, which is
-  Hyprland-specific; every click and keystroke still goes through XTest on
-  the rootless XWayland display, which wlroots forwards into the real
-  compositor seat regardless of whether the focused window is XWayland or
-  native. On a wlroots compositor other than Hyprland the overlay still
-  covers the screen correctly, but window switching falls back to the
-  X11/xdotool path, which only sees XWayland windows. A layer-shell surface
-  belongs to exactly one monitor by protocol design, so it is pinned to
-  whichever one the pointer is on -- untested on more than one, since this
+- **Wayland support is several separate things, not all of them
+  Hyprland-only.** The overlay (every mode's fullscreen window) uses
+  `gtk-layer-shell` and works on any wlroots compositor -- Sway included, not
+  just Hyprland. Key combos fall back to `wtype` on any wlroots compositor
+  too. Window switching, activation and geometry go through `hyprctl`, which
+  is Hyprland-specific; on another wlroots compositor that falls back to the
+  X11/xdotool path, which only sees XWayland windows. Clicking is
+  Hyprland-only for a harder reason: XTestFakeButtonEvent does not reach a
+  native-Wayland window *at all* -- confirmed live against qutebrowser, not a
+  coordinate bug, the click simply never arrives -- so it needs a real
+  pointer move (`hyprctl dispatch movecursor`, since `XWarpPointer` only
+  moves XWayland's own separate virtual pointer) paired with a real button
+  event (`ydotool`, kernel-level `/dev/uinput`). Neither has a
+  generic-wlroots equivalent installed here, so on a compositor other than
+  Hyprland a click on a native-Wayland window silently lands nowhere -- the
+  same failure this fixed on Hyprland, just without the fix. A layer-shell
+  surface belongs to exactly one monitor by protocol design, so it is pinned
+  to whichever one the pointer is on -- untested on more than one, since this
   project's only monitor is a single 1366x768 panel.
 
 ## Tests

@@ -117,6 +117,43 @@ def activate(address):
         return False
 
 
+def cursor_position():
+    """The compositor's real pointer position, or None.
+
+    x11.pointer_position() cannot stand in for this on Hyprland: it reads
+    XWayland's own separate virtual pointer, which move_cursor's dispatch
+    never touches -- confirmed live, it kept answering a stale warped
+    position while this and hyprctl cursorpos agreed on the real one.
+    """
+    data = _query(["cursorpos"])
+    if not data:
+        return None
+    try:
+        return data["x"], data["y"]
+    except (KeyError, TypeError):
+        return None
+
+
+def move_cursor(x, y):
+    """Move the compositor's real pointer to (x, y).
+
+    XWarpPointer only moves XWayland's own virtual pointer -- confirmed live,
+    warping to a link's coordinates left hyprctl cursorpos completely
+    unmoved, and a click fired right after landed nowhere. This dispatch is
+    what wlroots itself treats as a real pointer move; click.py pairs it with
+    x11.ydotool_click, which is a real button event, for a click that
+    actually reaches a native-Wayland window on Hyprland.
+    """
+    try:
+        result = subprocess.run(
+            [_HYPRCTL, "dispatch", "movecursor", str(int(x)), str(int(y))],
+            capture_output=True, timeout=1, check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
 def active_workspace_id():
     """The workspace on screen, or None -- see x11.current_desktop()."""
     data = _query(["activeworkspace"])

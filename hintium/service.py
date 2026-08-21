@@ -61,6 +61,10 @@ def mode_path():
 _MODE_COMMANDS = frozenset(
     {"hint", "scroll", "search", "caret", "caret_search", "edit"})
 
+# _set_mode's argument, per command -- "caret_search" is the one that differs
+# from its own name, matching _enter_caret_search's "caret-search".
+_MODE_NAMES = {"caret_search": "caret-search"}
+
 
 def is_running(path=None):
     """True if a daemon is already answering on the socket."""
@@ -82,6 +86,7 @@ class Daemon:
         self.debug = debug
         self.config_path = config_path
         self.overlay = None
+        self._active_mode = None
         self._desktop = None
         self._desktop_watch = None
         self.path = socket_path()
@@ -175,6 +180,7 @@ class Daemon:
         self._clear_mode()
 
     def _set_mode(self, name):
+        self._active_mode = name
         try:
             with open(mode_path(), "w", encoding="utf-8") as handle:
                 handle.write(name)
@@ -232,6 +238,7 @@ class Daemon:
         return True
 
     def _clear_mode(self):
+        self._active_mode = None
         try:
             os.unlink(mode_path())
         except OSError:
@@ -281,6 +288,28 @@ class Daemon:
                 getattr(self.overlay, "holds_unsaved_work", False):
             self._log(f"editor open; ignoring {command}")
             _notify("An editor is open — :wq or :q! first.")
+            return
+
+        # A held hotkey repeats at the X11/GTK level: alt+j held over an open
+        # scroll session re-sends "scroll" on every autorepeat tick, and each
+        # one used to tear the session down and rebuild it (region detection
+        # alone runs 80ms-1s+), which is the 2-3s of visible glitching a held
+        # key produced. self._active_mode -- set by _set_mode the moment a
+        # mode has actually decided to open, cleared only when it actually
+        # closes (_clear_mode) -- reads "still scroll" for every repeat in
+        # such a burst, no matter how long the rebuild those repeats are
+        # piling up behind takes; a timing window could not, since the main
+        # loop is single-threaded and a repeat is not even dispatched until
+        # the rebuild it arrived during has already released it. Because it
+        # is set only on genuine success, a repeat is never blocked by a
+        # session that decided to open nothing (nothing found, no VTE, ...) --
+        # there was nothing to leave stuck open. A repeat for a *different*
+        # mode is unaffected -- switching mode is still instant -- and once a
+        # stuck mode is closed by any means, the same hotkey works again
+        # immediately, which is what recovers one.
+        if command in _MODE_COMMANDS and \
+                self._active_mode == _MODE_NAMES.get(command, command):
+            self._log(f"{command} already open; ignoring the repeat")
             return
 
         if command == "hint":
@@ -691,6 +720,13 @@ class Daemon:
                 # virtualised pane, so this is the case most likely to have
                 # something worth promoting once the outline is up.
                 self._log("no region reported; scrolling the window itself")
+                # Stamped here rather than left to _set_mode inside
+                # _enter_scroll's own deferred idle callback: this call is
+                # still synchronous with the region detection above, so a
+                # repeat arriving while that ran (see dispatch's own comment
+                # on _active_mode) reads "still scroll" instead of a stale
+                # value from before this scroll even started.
+                self._active_mode = "scroll"
                 self._enter_scroll(fallback,
                                    deferred=getattr(regions, "deferred", []))
                 return False
@@ -723,6 +759,7 @@ class Daemon:
                   f"{f', {len(deferred)} deferred' if deferred else ''}; "
                   f"entering scroll mode on "
                   f"({chosen.x},{chosen.y},{chosen.w},{chosen.h})")
+        self._active_mode = "scroll"  # see the other _enter_scroll call above
         self._enter_scroll(chosen, regions, deferred)
         return False
 
